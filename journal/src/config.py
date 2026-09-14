@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 APP_NAME = "Voice Journal"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 # Fixed Window Dimensions (Strict rectangular format)
 WINDOW_WIDTH = 640
@@ -43,7 +43,7 @@ AUDIO_CHANNELS = 1
 RMS_REFRESH_MS = 30
 
 def detect_obsidian_vault() -> str:
-    """Attempts to auto-detect active Obsidian vault from obsidian.json."""
+    r"""Attempts to auto-detect active Obsidian vault from obsidian.json, defaulting to C:\Tethis-System."""
     default_vault = r"C:\Tethis-System"
     obsidian_conf = Path(os.environ.get("APPDATA", "")) / "obsidian" / "obsidian.json"
     if obsidian_conf.exists():
@@ -60,17 +60,27 @@ def detect_obsidian_vault() -> str:
     return default_vault
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # Obsidian Vault & Canonical Academy Paths
     "obsidian_vault_path": detect_obsidian_vault(),
+    "academy_journal_folder": "Academy/Journal",
+    "voice_attachments_folder": "Academy/Journal/Attachments/VoiceLogs",
+    
+    # Local-First AI Configuration
+    "llm_provider": "local",  # "local" (default) or "cloud"
+    "local_llm_url": "http://localhost:11434/v1",  # OpenAI-compatible (Ollama, llama-server, LM Studio)
+    "local_llm_model": "qwen2.5:7b-instruct",     # Qwen family candidate
+    "local_llm_timeout": 20,
+    
+    # Local Speech-to-Text
+    "stt_provider": "local",  # "local" (default) or "cloud"
+    
+    # Optional Cloud Fallback (Disabled by default)
     "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
     "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
-    "ai_provider": "gemini",  # "gemini" or "openai" or "offline"
     "gemini_model": "gemini-2.5-flash",
-    "hotkey": "alt+shift",
-    "save_audio_attachments": True,
-    "attachments_folder": "Attachments/VoiceLogs",
-    "journal_folder": "Journal/Voice",
-    "daily_notes_folder": "Daily Notes",
-    "auto_link_vault": True
+    
+    # Hotkey
+    "hotkey": "alt+shift"
 }
 
 def load_config() -> Dict[str, Any]:
@@ -81,7 +91,6 @@ def load_config() -> Dict[str, Any]:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-            # Ensure all keys exist
             merged = DEFAULT_CONFIG.copy()
             merged.update(cfg)
             return merged

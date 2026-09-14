@@ -2,44 +2,56 @@ import os
 import re
 import difflib
 from pathlib import Path
-from typing import Dict, Any, List, Set, Tuple, Optional
+from typing import Dict, Any, List, Set, Optional
 from datetime import datetime
 
 class VaultGraphIndexer:
-    """
-    Gate 1: Scans and indexes all existing Markdown notes, aliases, and tags in the Obsidian vault.
-    Builds an in-memory knowledge index for fast link resolution.
+    r"""
+    Gate 1: Scans and incrementally indexes all existing Markdown notes, aliases, and tags in C:\Tethis-System.
+    Builds an in-memory knowledge index for fast link and faculty resolution.
     """
 
     def __init__(self, vault_path: str):
         self.vault_path = Path(vault_path) if vault_path else None
-        self.note_titles: Dict[str, str] = {}  # lowercase_title -> original_title
-        self.aliases: Dict[str, str] = {}      # lowercase_alias -> original_title
+        self.note_titles: Dict[str, str] = {}      # lowercase_title -> original_title
+        self.note_paths: Dict[str, Path] = {}      # original_title -> Path
+        self.aliases: Dict[str, str] = {}          # lowercase_alias -> canonical_original_title
         self.all_tags: Set[str] = set()
+        self.file_mtimes: Dict[str, float] = {}    # file_path -> last_mtime
         self.last_indexed: Optional[datetime] = None
 
-    def refresh_index(self) -> None:
-        """Scans the vault directory and builds the knowledge graph index."""
+    def refresh_index(self, force: bool = False) -> None:
+        """Incrementally scans the vault directory without rescanning unchanged files."""
         if not self.vault_path or not self.vault_path.is_dir():
             return
 
-        self.note_titles.clear()
-        self.aliases.clear()
-        self.all_tags.clear()
+        if force:
+            self.note_titles.clear()
+            self.note_paths.clear()
+            self.aliases.clear()
+            self.all_tags.clear()
+            self.file_mtimes.clear()
 
         for md_file in self.vault_path.rglob("*.md"):
             # Exclude hidden files / .obsidian
             if ".obsidian" in md_file.parts:
                 continue
 
-            orig_title = md_file.stem
-            lower_title = orig_title.lower()
-            self.note_titles[lower_title] = orig_title
-
-            # Parse frontmatter for aliases and tags
             try:
+                mtime = md_file.stat().st_mtime
+                rel_key = str(md_file)
+                if rel_key in self.file_mtimes and self.file_mtimes[rel_key] == mtime:
+                    continue  # File unchanged, skip parsing
+
+                self.file_mtimes[rel_key] = mtime
+                orig_title = md_file.stem
+                lower_title = orig_title.lower()
+                self.note_titles[lower_title] = orig_title
+                self.note_paths[orig_title] = md_file
+
+                # Parse frontmatter for aliases and tags
                 with open(md_file, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read(2048)  # Read header chunk
+                    content = f.read(2048)
                     self._parse_frontmatter(content, orig_title)
             except Exception:
                 pass
@@ -56,13 +68,16 @@ class VaultGraphIndexer:
         for line in fm_text.splitlines():
             line = line.strip()
             # Parse aliases
-            if line.startswith("aliases:"):
-                raw_aliases = line.replace("aliases:", "").strip()
+            if line.startswith("aliases:") or line.startswith("alias:"):
+                raw_aliases = re.sub(r"^alias(es)?:\s*", "", line)
                 if raw_aliases.startswith("[") and raw_aliases.endswith("]"):
                     items = [x.strip().strip("\"'") for x in raw_aliases[1:-1].split(",")]
                     for item in items:
                         if item:
                             self.aliases[item.lower()] = orig_title
+                elif raw_aliases:
+                    self.aliases[raw_aliases.strip("\"'").lower()] = orig_title
+
             # Parse tags
             elif line.startswith("tags:"):
                 raw_tags = line.replace("tags:", "").strip()
@@ -73,206 +88,293 @@ class VaultGraphIndexer:
 
 class EntityTopicResolutionGate:
     """
-    Gate 2: Resolves extracted candidate topics against existing vault notes.
-    Applies exact matching, alias lookup, and Levenshtein fuzzy matching.
+    Gate 2: Resolves extracted candidate academic topics against existing vault notes.
+    Applies exact matching, alias lookup, strong fuzzy matching, and common academic entity normalization.
     """
+
+    # Academic term normalizations (spoken variations -> canonical terms)
+    KNOWN_NORMALIZATIONS = {
+        "c plus plus": "C++ Programming",
+        "cpp": "C++ Programming",
+        "c++": "C++ Programming",
+        "dsa": "Data Structures & Algorithms",
+        "data structure": "Data Structures",
+        "os": "Operating Systems",
+        "dbms": "Database Management Systems",
+        "oops": "Object Oriented Programming",
+        "oop": "Object Oriented Programming",
+        "pointers": "Pointers",
+        "type casting": "Type Casting",
+        "variables": "Variables",
+        "data types": "Data Types"
+    }
 
     def __init__(self, indexer: VaultGraphIndexer):
         self.indexer = indexer
 
     def resolve_topic(self, topic: str) -> Dict[str, Any]:
         """
-        Resolves a topic string into a structured link target.
-        Returns: {
-            "original": str,
-            "target": str,
-            "wikilink": str,
-            "match_type": "exact" | "alias" | "fuzzy" | "new_topic"
-        }
+        Resolves a topic string into a structured Wikilink target.
+        Prefers existing vault notes over creating new ones.
         """
         clean_topic = self._clean_filename(topic.strip())
         if not clean_topic:
-            return {
-                "original": topic,
-                "target": topic,
-                "wikilink": f"[[{topic}]]",
-                "match_type": "new_topic"
-            }
+            return {"target": topic, "wikilink": f"[[{topic}]]", "match_type": "new_entity"}
 
         lower = clean_topic.lower()
 
-        # 1. Exact Match with existing note title
+        # 0. Check Academic Normalization table
+        if lower in self.KNOWN_NORMALIZATIONS:
+            normalized = self.KNOWN_NORMALIZATIONS[lower]
+            # If normalized exists in vault, use it
+            if normalized.lower() in self.indexer.note_titles:
+                canonical = self.indexer.note_titles[normalized.lower()]
+                return {"target": canonical, "wikilink": f"[[{canonical}]]", "match_type": "exact"}
+            # Otherwise use normalized title
+            return {"target": normalized, "wikilink": f"[[{normalized}]]", "match_type": "normalized"}
+
+        # 1. Exact Match with existing vault note
         if lower in self.indexer.note_titles:
             canonical = self.indexer.note_titles[lower]
-            return {
-                "original": topic,
-                "target": canonical,
-                "wikilink": f"[[{canonical}]]",
-                "match_type": "exact"
-            }
+            return {"target": canonical, "wikilink": f"[[{canonical}]]", "match_type": "exact"}
 
         # 2. Alias Match
         if lower in self.indexer.aliases:
             canonical = self.indexer.aliases[lower]
-            return {
-                "original": topic,
-                "target": canonical,
-                "wikilink": f"[[{canonical}|{clean_topic}]]",
-                "match_type": "alias"
-            }
+            return {"target": canonical, "wikilink": f"[[{canonical}]]", "match_type": "alias"}
 
-        # 3. Fuzzy Match against existing notes (similarity >= 0.85)
+        # 3. Strong Fuzzy Match (similarity cutoff >= 0.85)
         existing_keys = list(self.indexer.note_titles.keys())
         matches = difflib.get_close_matches(lower, existing_keys, n=1, cutoff=0.85)
         if matches:
             canonical = self.indexer.note_titles[matches[0]]
-            return {
-                "original": topic,
-                "target": canonical,
-                "wikilink": f"[[{canonical}|{clean_topic}]]",
-                "match_type": "fuzzy"
-            }
+            return {"target": canonical, "wikilink": f"[[{canonical}]]", "match_type": "fuzzy"}
 
-        # 4. New Concept Node
+        # 4. New Concept Node (only when no existing match found)
         return {
-            "original": topic,
             "target": clean_topic,
             "wikilink": f"[[{clean_topic}]]",
-            "match_type": "new_topic"
+            "match_type": "new_entity"
         }
 
     @staticmethod
     def _clean_filename(name: str) -> str:
-        """Removes illegal Windows and Obsidian filename characters."""
         return re.sub(r'[\\/:*?"<>|]', '', name).strip()
 
 
 class WikilinkFormatterGate:
     """
-    Gate 3: Formats entities and keywords inside markdown content with Obsidian [[Wikilinks]].
-    Avoids double-linking existing brackets.
+    Gate 3: Formats and validates Obsidian [[Wikilinks]] ensuring clean syntax without illegal characters.
     """
 
     @staticmethod
-    def format_wikilinks_in_text(text: str, resolved_entities: List[Dict[str, Any]]) -> str:
-        """Embeds [[Wikilinks]] into the summary text for mentioned concepts."""
-        result = text
-        for ent in resolved_entities:
-            target = ent["target"]
-            orig = ent["original"]
-            wikilink = ent["wikilink"]
-            
-            # Avoid replacing if already inside [[ ... ]]
-            pattern = re.compile(rf'(?<!\[\[)\b{re.escape(orig)}\b(?!\]\])', re.IGNORECASE)
-            result = pattern.sub(wikilink, result, count=1)
-        return result
+    def format_wikilinks(resolved_topics: List[Dict[str, Any]]) -> List[str]:
+        """Returns unique list of formatted Wikilinks."""
+        links = []
+        seen = set()
+        for r in resolved_topics:
+            wl = r.get("wikilink")
+            if wl and wl not in seen:
+                seen.add(wl)
+                links.append(wl)
+        return links
 
 
-class NoteRoutingAndInterlockGate:
+class DailyJournalBuilderGate:
     """
-    Gate 4 & 5: Determines destination paths, formats Obsidian YAML frontmatter,
-    embeds audio attachment references, and formats the Daily Note cross-link block.
+    Gate 4: Single Daily Journal Builder (Journal-YYYY-MM-DD.md).
+    Follows canonical schema:
+    ---
+    type: journal
+    date: YYYY-MM-DD
+    domain: academy
+    status: active
+    ---
+    Only populates applicable sections.
+    Merges subsequent entries on the same day without overwriting.
     """
 
     def __init__(self, vault_path: str):
         self.vault_path = Path(vault_path) if vault_path else None
 
-    def build_markdown_document(
+    def build_initial_daily_journal(
         self,
-        entry_id: str,
-        title: str,
-        timestamp_dt: datetime,
+        date_str: str,
+        time_str: str,
         raw_transcript: str,
         summary: str,
-        key_insights: List[str],
-        action_items: List[str],
-        resolved_entities: List[Dict[str, Any]],
-        category: str,
-        sentiment: str,
-        audio_rel_path: Optional[str] = None
+        what_i_learned: List[str],
+        connections: List[str],
+        progress: List[str],
+        problems: List[str],
+        decisions: List[str],
+        next_actions: List[str],
+        sources: List[str]
     ) -> str:
-        """Constructs a production-grade Obsidian Markdown document with full frontmatter."""
-        date_str = timestamp_dt.strftime("%Y-%m-%d")
-        time_str = timestamp_dt.strftime("%H:%M:%S")
+        """Constructs a fresh Journal-YYYY-MM-DD.md document."""
+        lines = [
+            "---",
+            "type: journal",
+            f"date: {date_str}",
+            "domain: academy",
+            "status: active",
+            "---",
+            "",
+            f"# Journal — {date_str}",
+            "",
+            "## Original Entry",
+            f"> [{time_str}] {raw_transcript.strip()}",
+            "",
+            "## Summary",
+            summary.strip()
+        ]
 
-        # Tags
-        tags = ["journal/voice", f"type/{category.lower()}"]
-        if sentiment:
-            tags.append(f"sentiment/{sentiment.lower()}")
+        if what_i_learned:
+            lines.append("")
+            lines.append("## What I Learned")
+            for item in what_i_learned:
+                lines.append(f"- {item}")
 
-        # Build wikilink list
-        wikilinks_formatted = "\n".join([f"- {e['wikilink']}" for e in resolved_entities])
-        if not wikilinks_formatted:
-            wikilinks_formatted = "- _None detected_"
+        if connections:
+            lines.append("")
+            lines.append("## Connections")
+            for item in connections:
+                lines.append(f"- {item}")
 
-        # Build insights list
-        insights_formatted = "\n".join([f"- {item}" for item in key_insights]) or "- _No specific insights recorded._"
+        if progress:
+            lines.append("")
+            lines.append("## Progress")
+            for item in progress:
+                lines.append(f"- {item}")
 
-        # Build action items
-        action_formatted = "\n".join([f"- [ ] {item}" for item in action_items]) or "- _No active tasks identified._"
+        if problems:
+            lines.append("")
+            lines.append("## Problems")
+            for item in problems:
+                lines.append(f"- {item}")
 
-        # Audio player embed
-        audio_embed = f"![[{audio_rel_path}]]" if audio_rel_path else "_No audio attachment_"
+        if decisions:
+            lines.append("")
+            lines.append("## Decisions")
+            for item in decisions:
+                lines.append(f"- {item}")
 
-        doc = f"""---
-id: "{entry_id}"
-title: "{title}"
-date: {date_str}
-time: {time_str}
-type: voice-journal
-category: "{category}"
-sentiment: "{sentiment}"
-tags:
-{chr(10).join(f'  - {t}' for t in tags)}
-audio_file: "{audio_rel_path or ''}"
----
+        if next_actions:
+            lines.append("")
+            lines.append("## Next Actions")
+            for item in next_actions:
+                lines.append(f"- [ ] {item}")
 
-# 🎙️ {title}
-> *Recorded on **{date_str}** at **{time_str}*** | [[Daily Notes/{date_str}|📅 Daily Note]]
+        if sources:
+            lines.append("")
+            lines.append("## Sources")
+            for item in sources:
+                lines.append(f"- {item}")
 
----
+        lines.append("")
+        return "\n".join(lines)
 
-## 🎧 Audio Recording
-{audio_embed}
+    def merge_into_existing_daily_journal(
+        self,
+        existing_content: str,
+        time_str: str,
+        raw_transcript: str,
+        summary: str,
+        what_i_learned: List[str],
+        connections: List[str],
+        progress: List[str],
+        problems: List[str],
+        decisions: List[str],
+        next_actions: List[str],
+        sources: List[str]
+    ) -> str:
+        """
+        Merges a subsequent academic event into today's existing Journal-YYYY-MM-DD.md.
+        Appends raw input, summary, and relevant section items without losing earlier records.
+        """
+        content = existing_content
 
----
+        # 1. Append to ## Original Entry
+        raw_snippet = f"\n> [{time_str}] {raw_transcript.strip()}"
+        if "## Original Entry" in content:
+            content = self._append_to_section(content, "## Original Entry", raw_snippet)
+        else:
+            content += f"\n\n## Original Entry{raw_snippet}"
 
-## 🧠 Synthesized Summary
-{summary}
+        # 2. Append to ## Summary
+        summary_snippet = f"\n- **{time_str}**: {summary.strip()}"
+        if "## Summary" in content:
+            content = self._append_to_section(content, "## Summary", summary_snippet)
+        else:
+            content += f"\n\n## Summary{summary_snippet}"
 
----
+        # 3. Append to ## What I Learned
+        if what_i_learned:
+            learned_snippet = "\n" + "\n".join(f"- {item}" for item in what_i_learned)
+            content = self._ensure_or_append_section(content, "## What I Learned", learned_snippet)
 
-## 💡 Key Insights & Reflections
-{insights_formatted}
+        # 4. Append to ## Connections (prevent exact duplicates)
+        if connections:
+            conn_snippet = "\n" + "\n".join(f"- {item}" for item in connections if item not in content)
+            if conn_snippet.strip():
+                content = self._ensure_or_append_section(content, "## Connections", conn_snippet)
 
----
+        # 5. Append to ## Progress
+        if progress:
+            prog_snippet = "\n" + "\n".join(f"- {item}" for item in progress)
+            content = self._ensure_or_append_section(content, "## Progress", prog_snippet)
 
-## 🎯 Action Items & Next Steps
-{action_formatted}
+        # 6. Append to ## Problems
+        if problems:
+            prob_snippet = "\n" + "\n".join(f"- {item}" for item in problems)
+            content = self._ensure_or_append_section(content, "## Problems", prob_snippet)
 
----
+        # 7. Append to ## Decisions
+        if decisions:
+            dec_snippet = "\n" + "\n".join(f"- {item}" for item in decisions)
+            content = self._ensure_or_append_section(content, "## Decisions", dec_snippet)
 
-## 🔗 Knowledge Graph Connections
-{wikilinks_formatted}
+        # 8. Append to ## Next Actions
+        if next_actions:
+            act_snippet = "\n" + "\n".join(f"- [ ] {item}" for item in next_actions)
+            content = self._ensure_or_append_section(content, "## Next Actions", act_snippet)
 
----
+        # 9. Append to ## Sources
+        if sources:
+            src_snippet = "\n" + "\n".join(f"- {item}" for item in sources if item not in content)
+            if src_snippet.strip():
+                content = self._ensure_or_append_section(content, "## Sources", src_snippet)
 
-## 📝 Raw Voice Transcript
-```text
-{raw_transcript}
-```
-"""
-        return doc
+        return content
+
+    @staticmethod
+    def _append_to_section(content: str, section_header: str, new_text: str) -> str:
+        """Appends text right before the next ## section header or end of file."""
+        pos = content.find(section_header)
+        if pos == -1:
+            return content + f"\n\n{section_header}{new_text}"
+
+        start_search = pos + len(section_header)
+        next_sec = content.find("\n## ", start_search)
+        if next_sec != -1:
+            return content[:next_sec].rstrip() + f"{new_text}\n\n" + content[next_sec:].lstrip()
+        else:
+            return content.rstrip() + f"{new_text}\n"
+
+    def _ensure_or_append_section(self, content: str, section_header: str, items_text: str) -> str:
+        if section_header in content:
+            return self._append_to_section(content, section_header, items_text)
+        else:
+            return content.rstrip() + f"\n\n{section_header}{items_text}\n"
 
 
 class LogicGatesEngine:
     """
-    Master Controller orchestrating all 5 Python Logic Gates:
-    1. Scan & Index Vault
-    2. Match & Classify Entities
-    3. Format Wikilinks
-    4. Route Note & Build Document
-    5. Daily Note Interlock
+    Master Academic Logic Gates Controller:
+    - Index vault & resolve faculty / subjects
+    - Format valid Wikilinks
+    - Assemble single-file daily journal (Journal-YYYY-MM-DD.md)
+    - Fallback preservation
     """
 
     def __init__(self, vault_path: str):
@@ -280,64 +382,82 @@ class LogicGatesEngine:
         self.indexer = VaultGraphIndexer(vault_path)
         self.entity_gate = EntityTopicResolutionGate(self.indexer)
         self.formatter_gate = WikilinkFormatterGate()
-        self.routing_gate = NoteRoutingAndInterlockGate(vault_path)
+        self.daily_builder = DailyJournalBuilderGate(vault_path)
         self.indexer.refresh_index()
 
-    def process_entry(
+    def process_academic_entry(
         self,
+        raw_text: str,
         ai_data: Dict[str, Any],
-        entry_id: str,
         timestamp_dt: datetime,
-        audio_rel_path: Optional[str] = None
+        existing_journal_content: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Runs the full logic gate pipeline on an AI synthesis dictionary.
-        Returns: {
-            "title": str,
-            "markdown_content": str,
-            "resolved_entities": List[dict],
-            "daily_note_entry": str
-        }
+        Orchestrates entity resolution, wikilink formation, and daily journal markdown generation.
         """
-        title = ai_data.get("title", "Voice Thought")
-        raw_transcript = ai_data.get("raw_transcript", "")
-        summary = ai_data.get("summary", "")
-        key_insights = ai_data.get("key_insights", [])
-        action_items = ai_data.get("action_items", [])
-        raw_entities = ai_data.get("entities_and_topics", [])
-        category = ai_data.get("category", "Reflection")
-        sentiment = ai_data.get("sentiment", "Focused")
-
-        # Gate 1 & 2: Resolve topics against vault index
-        resolved = [self.entity_gate.resolve_topic(t) for t in raw_entities if t.strip()]
-
-        # Gate 3: Format wikilinks within summary
-        linked_summary = self.formatter_gate.format_wikilinks_in_text(summary, resolved)
-
-        # Gate 4: Assemble Markdown Document
-        doc = self.routing_gate.build_markdown_document(
-            entry_id=entry_id,
-            title=title,
-            timestamp_dt=timestamp_dt,
-            raw_transcript=raw_transcript,
-            summary=linked_summary,
-            key_insights=key_insights,
-            action_items=action_items,
-            resolved_entities=resolved,
-            category=category,
-            sentiment=sentiment,
-            audio_rel_path=audio_rel_path
-        )
-
-        # Gate 5: Build daily note interlock snippet
+        self.indexer.refresh_index()
+        date_str = timestamp_dt.strftime("%Y-%m-%d")
         time_str = timestamp_dt.strftime("%H:%M")
-        daily_snippet = f"- **{time_str}** [[Journal/Voice/{timestamp_dt.strftime('%Y-%m-%d_%H%M%S')}|🎙️ {title}]]: {summary}\n"
+
+        summary = ai_data.get("summary", raw_text)
+        topics = ai_data.get("topics", [])
+        entities = ai_data.get("entities", [])
+        suggested = ai_data.get("suggested_links", [])
+        what_i_learned = ai_data.get("what_i_learned", [])
+        problems = ai_data.get("learning_gaps", [])
+        assignments = ai_data.get("assignments", [])
+        tasks = ai_data.get("tasks", [])
+        decisions = ai_data.get("decisions", [])
+        progress = ai_data.get("progress", [])
+
+        # Combine tasks and assignments for Next Actions
+        all_actions = list(dict.fromkeys(tasks + [f"Assignment: {a}" for a in assignments]))
+
+        # Gate 2: Entity & Topic Resolution
+        all_candidates = list(dict.fromkeys(topics + entities + suggested))
+        resolved_entities = [self.entity_gate.resolve_topic(c) for c in all_candidates if c.strip()]
+
+        # Gate 3: Wikilink Formatting
+        connections = self.formatter_gate.format_wikilinks(resolved_entities)
+
+        # Gate 4: Build or Merge into Daily Journal
+        if existing_journal_content:
+            journal_markdown = self.daily_builder.merge_into_existing_daily_journal(
+                existing_content=existing_journal_content,
+                time_str=time_str,
+                raw_transcript=raw_text,
+                summary=summary,
+                what_i_learned=what_i_learned,
+                connections=connections,
+                progress=progress,
+                problems=problems,
+                decisions=decisions,
+                next_actions=all_actions,
+                sources=[]
+            )
+        else:
+            journal_markdown = self.daily_builder.build_initial_daily_journal(
+                date_str=date_str,
+                time_str=time_str,
+                raw_transcript=raw_text,
+                summary=summary,
+                what_i_learned=what_i_learned,
+                connections=connections,
+                progress=progress,
+                problems=problems,
+                decisions=decisions,
+                next_actions=all_actions,
+                sources=[]
+            )
 
         return {
-            "title": title,
-            "markdown_content": doc,
-            "resolved_entities": resolved,
-            "daily_note_snippet": daily_snippet,
-            "category": category,
-            "sentiment": sentiment
+            "date_str": date_str,
+            "filename": f"Journal-{date_str}.md",
+            "journal_markdown": journal_markdown,
+            "summary": summary,
+            "connections": connections,
+            "actions": all_actions,
+            "problems": problems,
+            "what_i_learned": what_i_learned,
+            "resolved_entities": resolved_entities
         }

@@ -6,7 +6,10 @@ from typing import Dict, Any, List, Optional
 from config import DB_PATH
 
 class StorageManager:
-    """Manages the local SQLite registry for voice recordings, raw transcripts, and AI outputs."""
+    """
+    Internal SQLite database for audit, recovery, and raw transcript preservation.
+    Note: The human-readable knowledge store remains the Obsidian vault.
+    """
 
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
@@ -18,82 +21,81 @@ class StorageManager:
         return conn
 
     def _init_db(self) -> None:
-        """Initializes tables if they do not exist."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS journal_entries (
+                CREATE TABLE IF NOT EXISTS academic_entries (
                     id TEXT PRIMARY KEY,
+                    date TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
+                    entry_type TEXT DEFAULT 'voice',
                     audio_path TEXT,
                     audio_duration REAL DEFAULT 0.0,
                     raw_transcript TEXT NOT NULL,
-                    title TEXT,
                     summary TEXT,
-                    key_insights_json TEXT,
-                    action_items_json TEXT,
-                    entities_json TEXT,
+                    ai_json TEXT,
                     vault_file_path TEXT,
+                    status TEXT DEFAULT 'processed',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_entries_timestamp 
-                ON journal_entries(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_academic_date 
+                ON academic_entries(date DESC, timestamp DESC);
             """)
             conn.commit()
 
     def insert_entry(self, entry: Dict[str, Any]) -> str:
-        """Inserts a new journal entry record."""
-        entry_id = entry.get("id") or datetime.now().strftime("%Y%m%d-%H%M%S")
-        timestamp = entry.get("timestamp") or datetime.now().isoformat()
-        
+        """Saves entry to local internal registry."""
+        now = datetime.now()
+        entry_id = entry.get("id") or now.strftime("%Y%m%d-%H%M%S")
+        date_str = entry.get("date") or now.strftime("%Y-%m-%d")
+        timestamp = entry.get("timestamp") or now.isoformat()
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO journal_entries (
-                    id, timestamp, audio_path, audio_duration,
-                    raw_transcript, title, summary,
-                    key_insights_json, action_items_json, entities_json,
-                    vault_file_path
+                INSERT OR REPLACE INTO academic_entries (
+                    id, date, timestamp, entry_type, audio_path, audio_duration,
+                    raw_transcript, summary, ai_json, vault_file_path, status
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 entry_id,
+                date_str,
                 timestamp,
+                entry.get("entry_type", "voice"),
                 entry.get("audio_path"),
                 float(entry.get("audio_duration", 0.0)),
                 entry.get("raw_transcript", ""),
-                entry.get("title", "Untitled Thought"),
                 entry.get("summary", ""),
-                json.dumps(entry.get("key_insights", []), ensure_ascii=False),
-                json.dumps(entry.get("action_items", []), ensure_ascii=False),
-                json.dumps(entry.get("entities", []), ensure_ascii=False),
-                entry.get("vault_file_path")
+                json.dumps(entry.get("ai_data", {}), ensure_ascii=False),
+                entry.get("vault_file_path"),
+                entry.get("status", "processed")
             ))
             conn.commit()
         return entry_id
 
     def get_recent_entries(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Retrieves recent journal entries ordered by timestamp descending."""
+        """Retrieves recent entries for audit or review."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT * FROM journal_entries 
+                SELECT * FROM academic_entries 
                 ORDER BY timestamp DESC LIMIT ?
             """, (limit,))
             rows = cursor.fetchall()
             results = []
             for row in rows:
                 item = dict(row)
-                item["key_insights"] = json.loads(item.get("key_insights_json") or "[]")
-                item["action_items"] = json.loads(item.get("action_items_json") or "[]")
-                item["entities"] = json.loads(item.get("entities_json") or "[]")
+                try:
+                    item["ai_data"] = json.loads(item.get("ai_json") or "{}")
+                except Exception:
+                    item["ai_data"] = {}
                 results.append(item)
             return results
 
     def get_entry_count(self) -> int:
-        """Returns total entries stored."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM journal_entries")
+            cursor.execute("SELECT COUNT(*) FROM academic_entries")
             return cursor.fetchone()[0]

@@ -3,7 +3,6 @@ import sys
 import time
 import queue
 import threading
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -26,14 +25,14 @@ from config import (
 from storage import StorageManager
 from audio_recorder import AudioRecorder
 from hotkey_listener import PushToTalkListener
-from speech_engine import SpeechAndSynthesisEngine
+from local_stt import LocalSTTProvider
+from local_llm import LocalLLMProvider
 from logic_gates import LogicGatesEngine
 from obsidian_vault import ObsidianVaultManager
 from ui_components import (
     StyledButton, Badge, SectionCard, WaveformVisualizer, ModernProgressBar
 )
 
-# Application States
 STATE_IDLE = "IDLE"
 STATE_RECORDING = "RECORDING"
 STATE_PROCESSING = "PROCESSING"
@@ -42,8 +41,9 @@ STATE_COMPLETED = "COMPLETED"
 
 class VoiceJournalApp(tk.Tk):
     """
-    Fixed-ratio desktop Voice Journal with Alt+Shift push-to-talk,
-    multimodal AI synthesis, and Obsidian knowledge vault integration.
+    Local-First Academic Voice & Text Journal.
+    Captures daily college experiences, learning, assignments, and problems.
+    Organizes automatically into C:\\Tethis-System\\Academy\\Journal\\Journal-YYYY-MM-DD.md.
     """
 
     def __init__(self):
@@ -53,7 +53,7 @@ class VoiceJournalApp(tk.Tk):
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.maxsize(WINDOW_WIDTH, WINDOW_HEIGHT)
-        self.resizable(False, False)  # Strict fixed rectangular format
+        self.resizable(False, False)  # Locked rectangular format
         self.configure(bg=BG_ROOT)
 
         # Center on screen
@@ -64,89 +64,92 @@ class VoiceJournalApp(tk.Tk):
         cy = max(0, (sh - WINDOW_HEIGHT) // 2)
         self.geometry(f"+{cx}+{cy}")
 
-        # Core State & Services
+        # Core Services
         self.config_data = load_config()
+        self.vault_path = self.config_data.get("obsidian_vault_path", detect_obsidian_vault())
         self.storage = StorageManager()
         self.recorder = AudioRecorder()
-        self.speech_engine = SpeechAndSynthesisEngine()
-        self.vault_mgr = ObsidianVaultManager(self.config_data.get("obsidian_vault_path", detect_obsidian_vault()))
-        self.logic_engine = LogicGatesEngine(self.config_data.get("obsidian_vault_path", detect_obsidian_vault()))
+        self.stt_provider = LocalSTTProvider()
+        self.llm_provider = LocalLLMProvider()
+        self.vault_mgr = ObsidianVaultManager(self.vault_path)
+        self.logic_engine = LogicGatesEngine(self.vault_path)
 
+        # State
         self.state = STATE_IDLE
         self.msg_queue = queue.Queue()
-        self.current_entry_id: Optional[str] = None
         self.last_saved_note_path: Optional[Path] = None
-        self.last_processed_result: Optional[Dict[str, Any]] = None
 
-        # Build GUI
+        # Build UI
         self._build_header()
         self._build_status_card()
-        self._build_content_area()
-        self._build_action_bar()
+        self._build_input_card()
+        self._build_results_viewer()
+        self._build_bottom_bar()
 
-        # Start Hotkey Listener
+        # Start Hotkey Listener for Alt+Shift
         self.hotkey_listener = PushToTalkListener(
             on_press=self._on_hotkey_down,
             on_release=self._on_hotkey_up
         )
         self.hotkey_listener.start()
 
-        # Setup message pump
+        # Message Pump
         self.after(25, self._process_queue)
-
-        # Ensure clean exit on window close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # -------------------------------------------------------------
     # UI Layout Construction
     # -------------------------------------------------------------
     def _build_header(self):
-        """Top bar with application branding, vault status, and settings button."""
-        header_frame = tk.Frame(self, bg=BG_ROOT, pady=10, padx=20)
-        header_frame.pack(fill="x")
+        """Top bar displaying branding, vault badge, model indicator, and settings."""
+        header_frame = tk.Frame(self, bg=BG_ROOT)
+        header_frame.pack(fill="x", padx=20, pady=(12, 8))
 
-        # Left: App title and icon
-        title_box = tk.Frame(header_frame, bg=BG_ROOT)
-        title_box.pack(side="left")
+        # Left: Title
+        left_box = tk.Frame(header_frame, bg=BG_ROOT)
+        left_box.pack(side="left")
 
-        lbl_icon = tk.Label(title_box, text="🎙️", font=(FONT_FAMILY, 16), bg=BG_ROOT, fg=ACCENT_CYAN)
+        lbl_icon = tk.Label(left_box, text="🎓", font=(FONT_FAMILY, 15), bg=BG_ROOT, fg=ACCENT_CYAN)
         lbl_icon.pack(side="left", padx=(0, 8))
 
         lbl_title = tk.Label(
-            title_box,
+            left_box,
             text=APP_NAME,
-            font=(FONT_FAMILY, 15, "bold"),
+            font=(FONT_FAMILY, 14, "bold"),
             bg=BG_ROOT,
             fg=TEXT_WHITE
         )
         lbl_title.pack(side="left")
 
-        # Right: Settings & Vault Badge
+        # Right: Badges and Settings
         right_box = tk.Frame(header_frame, bg=BG_ROOT)
         right_box.pack(side="right")
 
-        vault_name = Path(self.config_data.get("obsidian_vault_path", "Vault")).name
+        model_name = self.config_data.get("local_llm_model", "qwen2.5")
+        self.badge_model = Badge(right_box, text=f"⚡ {model_name}", color=ACCENT_PURPLE)
+        self.badge_model.pack(side="left", padx=(0, 8))
+
+        vault_name = Path(self.vault_path).name if self.vault_path else "Vault"
         self.badge_vault = Badge(right_box, text=f"📂 {vault_name}", color=ACCENT_CYAN)
-        self.badge_vault.pack(side="left", padx=(0, 10))
+        self.badge_vault.pack(side="left", padx=(0, 8))
 
         btn_settings = StyledButton(
             right_box,
-            text="⚙ Settings",
+            text="⚙",
             command=self._open_settings_dialog,
-            font_size=9,
-            padx=10,
-            pady=3
+            font_size=10,
+            padx=8,
+            pady=2
         )
         btn_settings.pack(side="left")
 
     def _build_status_card(self):
-        """Visualizer, state badge, duration timer, and instructions."""
+        """Recording visualizer, duration timer, and status badge."""
         self.status_card = SectionCard(self)
-        self.status_card.pack(fill="x", padx=20, pady=(0, 12))
+        self.status_card.pack(fill="x", padx=20, pady=(0, 10))
 
-        # Top row inside card: Status Indicator & Timer
         top_row = tk.Frame(self.status_card, bg=BG_CARD)
-        top_row.pack(fill="x", pady=(0, 8))
+        top_row.pack(fill="x", pady=(0, 6))
 
         self.badge_state = Badge(top_row, text="● READY", color=ACCENT_EMERALD)
         self.badge_state.pack(side="left")
@@ -154,153 +157,203 @@ class VoiceJournalApp(tk.Tk):
         self.lbl_timer = tk.Label(
             top_row,
             text="00:00",
-            font=(FONT_FAMILY, 13, "bold"),
+            font=(FONT_FAMILY, 11, "bold"),
             bg=BG_CARD,
             fg=TEXT_MUTED
         )
         self.lbl_timer.pack(side="right")
 
         # Dynamic Audio Waveform
-        self.visualizer = WaveformVisualizer(self.status_card, height=52)
-        self.visualizer.pack(fill="x", pady=(0, 10))
+        self.visualizer = WaveformVisualizer(self.status_card, height=42)
+        self.visualizer.pack(fill="x", pady=(0, 6))
 
-        # Progress bar (for AI processing)
-        self.prog_bar = ModernProgressBar(self.status_card, height=4)
-        self.prog_bar.pack(fill="x", pady=(0, 8))
+        # Progress bar
+        self.prog_bar = ModernProgressBar(self.status_card, height=3)
+        self.prog_bar.pack(fill="x", pady=(0, 6))
 
-        # Instructions / Context banner
-        self.lbl_instruction = tk.Label(
+        # Instruction ticker
+        self.lbl_status = tk.Label(
             self.status_card,
-            text="Hold [ Alt + Shift ] to speak your thoughts...",
-            font=(FONT_FAMILY, 10, "italic"),
+            text="Hold [ Alt + Shift ] to speak, or type notes below.",
+            font=(FONT_FAMILY, 9, "italic"),
             bg=BG_CARD,
             fg=TEXT_MUTED
         )
-        self.lbl_instruction.pack()
+        self.lbl_status.pack()
 
-    def _build_content_area(self):
-        """Scrollable notebook/viewer displaying Raw Transcript, AI Synthesis, and Wikilinks."""
-        self.content_card = SectionCard(self)
-        self.content_card.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+    def _build_input_card(self):
+        """Direct text input area with Submit button (Ctrl+Enter support)."""
+        input_card = SectionCard(self)
+        input_card.pack(fill="x", padx=20, pady=(0, 10))
 
-        # Header for the active entry
-        self.meta_row = tk.Frame(self.content_card, bg=BG_CARD)
-        self.meta_row.pack(fill="x", pady=(0, 6))
+        lbl_row = tk.Frame(input_card, bg=BG_CARD)
+        lbl_row.pack(fill="x", pady=(0, 4))
 
-        self.lbl_entry_title = tk.Label(
-            self.meta_row,
-            text="No Recording Active",
-            font=(FONT_FAMILY, 12, "bold"),
+        lbl_in = tk.Label(
+            lbl_row,
+            text="✏ Quick Capture (Speak or Type):",
+            font=(FONT_FAMILY, 9, "bold"),
             bg=BG_CARD,
             fg=TEXT_WHITE
         )
-        self.lbl_entry_title.pack(side="left")
+        lbl_in.pack(side="left")
 
-        self.badge_category = Badge(self.meta_row, text="Thought", color=ACCENT_PURPLE)
-        self.badge_category.pack(side="right", padx=(4, 0))
+        lbl_hint = tk.Label(
+            lbl_row,
+            text="Press Ctrl+Enter to save",
+            font=(FONT_FAMILY, 8),
+            bg=BG_CARD,
+            fg=TEXT_DIM
+        )
+        lbl_hint.pack(side="right")
 
-        self.badge_sentiment = Badge(self.meta_row, text="Focused", color=ACCENT_AMBER)
-        self.badge_sentiment.pack(side="right")
-
-        # Scrollable output box
-        self.text_container = tk.Frame(self.content_card, bg=BG_INPUT, highlightbackground=BORDER_SUBTLE, highlightthickness=1)
-        self.text_container.pack(fill="both", expand=True, pady=(4, 8))
-
-        self.output_text = tk.Text(
-            self.text_container,
+        # Text input box
+        self.entry_text = tk.Text(
+            input_card,
+            height=3,
             wrap="word",
             bg=BG_INPUT,
             fg=TEXT_WHITE,
             insertbackground=ACCENT_CYAN,
-            font=(FONT_FAMILY, 10),
+            font=(FONT_FAMILY, 9),
             relief="flat",
-            bd=8,
-            selectbackground=BORDER_SUBTLE,
-            selectforeground=TEXT_WHITE
+            bd=6,
+            highlightbackground=BORDER_SUBTLE,
+            highlightthickness=1
         )
-        self.output_text.pack(side="left", fill="both", expand=True)
+        self.entry_text.pack(fill="x", pady=(0, 6))
+        self.entry_text.bind("<Control-Return>", lambda _: self._on_text_submit())
 
-        scrollbar = ttk.Scrollbar(self.text_container, orient="vertical", command=self.output_text.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.output_text.configure(yscrollcommand=scrollbar.set)
+        # Submit button row
+        btn_row = tk.Frame(input_card, bg=BG_CARD)
+        btn_row.pack(fill="x")
 
-        # Initial placeholder
-        self._display_welcome_message()
-
-        # Bottom row inside content card: Wikilinks row
-        self.wikilinks_frame = tk.Frame(self.content_card, bg=BG_CARD)
-        self.wikilinks_frame.pack(fill="x", pady=(4, 0))
-
-        lbl_wiki_tag = tk.Label(
-            self.wikilinks_frame,
-            text="🔗 Obsidian Graph Links:",
-            font=(FONT_FAMILY, 9, "bold"),
-            bg=BG_CARD,
-            fg=TEXT_MUTED
-        )
-        lbl_wiki_tag.pack(side="left", padx=(0, 8))
-
-        self.tags_container = tk.Frame(self.wikilinks_frame, bg=BG_CARD)
-        self.tags_container.pack(side="left", fill="x", expand=True)
-
-    def _build_action_bar(self):
-        """Bottom toolbar with Push-to-Talk button, Open in Obsidian, and New Entry."""
-        action_bar = tk.Frame(self, bg=BG_ROOT)
-        action_bar.pack(fill="x", padx=20, pady=(0, 16))
-
-        # Left: Manual push-to-talk button
         self.btn_ptt = StyledButton(
-            action_bar,
-            text="🎙 Push & Hold to Talk",
-            bg_color=BG_CARD,
-            hover_color=BG_CARD_HOVER,
-            border_color=ACCENT_CYAN,
-            font_size=10
+            btn_row,
+            text="🎙 Hold to Talk",
+            bg_color=BG_CARD_HOVER,
+            hover_color=BORDER_SUBTLE,
+            font_size=9,
+            padx=12,
+            pady=4
         )
         self.btn_ptt.pack(side="left")
         self.btn_ptt.bind("<ButtonPress-1>", lambda _: self._on_hotkey_down())
         self.btn_ptt.bind("<ButtonRelease-1>", lambda _: self._on_hotkey_up())
 
-        # Right: Obsidian link & New Entry
-        self.btn_open_obsidian = StyledButton(
-            action_bar,
-            text="↗ Open Note in Obsidian",
+        self.btn_submit = StyledButton(
+            btn_row,
+            text="Process & Save Entry",
+            command=self._on_text_submit,
+            bg_color=ACCENT_CYAN,
+            fg_color=BG_ROOT,
+            hover_color=TEXT_WHITE,
+            font_size=9,
+            padx=14,
+            pady=4
+        )
+        self.btn_submit.pack(side="right")
+
+    def _build_results_viewer(self):
+        """Scrollable results area displaying Daily Journal preview and Wikilinks."""
+        results_card = SectionCard(self)
+        results_card.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+        top_row = tk.Frame(results_card, bg=BG_CARD)
+        top_row.pack(fill="x", pady=(0, 4))
+
+        self.lbl_journal_target = tk.Label(
+            top_row,
+            text=f"Journal Target: Academy/Journal/Journal-{datetime.now().strftime('%Y-%m-%d')}.md",
+            font=(FONT_FAMILY, 9, "bold"),
+            bg=BG_CARD,
+            fg=ACCENT_CYAN
+        )
+        self.lbl_journal_target.pack(side="left")
+
+        # Text display
+        text_frame = tk.Frame(results_card, bg=BG_INPUT, highlightbackground=BORDER_SUBTLE, highlightthickness=1)
+        text_frame.pack(fill="both", expand=True, pady=(2, 6))
+
+        self.display_text = tk.Text(
+            text_frame,
+            wrap="word",
+            bg=BG_INPUT,
+            fg=TEXT_WHITE,
+            insertbackground=ACCENT_CYAN,
+            font=(FONT_FAMILY, 9),
+            relief="flat",
+            bd=6,
+            selectbackground=BORDER_SUBTLE,
+            selectforeground=TEXT_WHITE
+        )
+        self.display_text.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.display_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.display_text.configure(yscrollcommand=scrollbar.set)
+
+        self._show_welcome_text()
+
+        # Wikilinks container
+        wiki_row = tk.Frame(results_card, bg=BG_CARD)
+        wiki_row.pack(fill="x")
+
+        lbl_w = tk.Label(wiki_row, text="🔗 Links:", font=(FONT_FAMILY, 8, "bold"), bg=BG_CARD, fg=TEXT_MUTED)
+        lbl_w.pack(side="left", padx=(0, 6))
+
+        self.links_container = tk.Frame(wiki_row, bg=BG_CARD)
+        self.links_container.pack(side="left", fill="x", expand=True)
+
+    def _build_bottom_bar(self):
+        """Bottom toolbar with Open in Obsidian and New Entry."""
+        bottom_bar = tk.Frame(self, bg=BG_ROOT)
+        bottom_bar.pack(fill="x", padx=20, pady=(0, 14))
+
+        lbl_vault_note = tk.Label(
+            bottom_bar,
+            text="Stored in C:\\Tethis-System",
+            font=(FONT_FAMILY, 8),
+            bg=BG_ROOT,
+            fg=TEXT_DIM
+        )
+        lbl_vault_note.pack(side="left")
+
+        self.btn_open = StyledButton(
+            bottom_bar,
+            text="↗ Open Today's Journal in Obsidian",
             command=self._open_in_obsidian,
             bg_color=BG_CARD,
             hover_color=BG_CARD_HOVER,
-            font_size=9
+            font_size=9,
+            padx=12,
+            pady=4
         )
-        self.btn_open_obsidian.pack(side="right", padx=(8, 0))
-
-        self.btn_new = StyledButton(
-            action_bar,
-            text="✨ New Entry",
-            command=self._reset_to_idle,
-            bg_color=BG_CARD,
-            hover_color=BG_CARD_HOVER,
-            font_size=9
-        )
-        self.btn_new.pack(side="right")
+        self.btn_open.pack(side="right")
 
     # -------------------------------------------------------------
-    # State Transitions & Recording Flow
+    # Capture & Processing Flow
     # -------------------------------------------------------------
     def _on_hotkey_down(self):
-        """Triggered when Alt+Shift is pressed down."""
-        if self.state == STATE_RECORDING or self.state == STATE_PROCESSING:
+        if self.state in (STATE_RECORDING, STATE_PROCESSING):
             return
-
         self.msg_queue.put(("START_RECORDING", None))
 
     def _on_hotkey_up(self):
-        """Triggered when Alt+Shift is released."""
         if self.state != STATE_RECORDING:
             return
-
         self.msg_queue.put(("STOP_RECORDING", None))
 
+    def _on_text_submit(self):
+        if self.state == STATE_PROCESSING:
+            return
+        text = self.entry_text.get("1.0", tk.END).strip()
+        if not text:
+            return
+        self.entry_text.delete("1.0", tk.END)
+        self._start_processing(raw_text=text, audio_path=None, duration=0.0)
+
     def _process_queue(self):
-        """Polls messages from background threads."""
         try:
             while not self.msg_queue.empty():
                 msg_type, payload = self.msg_queue.get_nowait()
@@ -319,31 +372,27 @@ class VoiceJournalApp(tk.Tk):
                         secs = int(dur) % 60
                         self.lbl_timer.config(text=f"{mins:02d}:{secs:02d}")
 
-                elif msg_type == "SYNTHESIS_PROGRESS":
-                    progress, text = payload
-                    self.prog_bar.set_progress(progress)
-                    self.lbl_instruction.config(text=text)
+                elif msg_type == "PROGRESS":
+                    pct, text = payload
+                    self.prog_bar.set_progress(pct)
+                    self.lbl_status.config(text=text)
 
-                elif msg_type == "ENTRY_PROCESSED":
-                    self._on_entry_complete(payload)
+                elif msg_type == "ENTRY_COMPLETE":
+                    self._render_completed_entry(payload)
 
-                elif msg_type == "PROCESSING_ERROR":
-                    self._on_error(payload)
+                elif msg_type == "ERROR":
+                    self._render_error(payload)
 
         except Exception as e:
-            print(f"[Main] Error in queue processing: {e}")
+            print(f"[Main] Queue pump error: {e}")
 
         self.after(25, self._process_queue)
 
     def _start_recording(self):
-        """Initiates microphone capture and updates visual state."""
         self.state = STATE_RECORDING
         self.badge_state.lbl.config(text="● RECORDING", fg=ACCENT_ROSE)
         self.badge_state.config(highlightbackground=ACCENT_ROSE)
-        self.lbl_instruction.config(
-            text="Speaking... (Release [Alt+Shift] when finished)",
-            fg=ACCENT_ROSE
-        )
+        self.lbl_status.config(text="Listening... Release [Alt+Shift] when finished.", fg=ACCENT_ROSE)
         self.btn_ptt.configure(bg=ACCENT_ROSE, activebackground=ACCENT_ROSE)
         self.prog_bar.set_progress(0.0)
 
@@ -351,302 +400,266 @@ class VoiceJournalApp(tk.Tk):
             rms_callback=lambda rms: self.msg_queue.put(("RMS_UPDATE", rms))
         )
         if not started:
-            self._reset_to_idle()
-            messagebox.showerror("Microphone Error", "Could not open audio input stream. Check your default microphone.")
+            self._reset_idle()
+            messagebox.showerror("Mic Error", "Could not start audio recording stream.")
 
     def _stop_recording_and_process(self):
-        """Stops microphone stream and launches background AI & Logic Gates thread."""
-        self.state = STATE_PROCESSING
-        self.badge_state.lbl.config(text="● SYNTHESIZING", fg=ACCENT_AMBER)
-        self.badge_state.config(highlightbackground=ACCENT_AMBER)
-        self.btn_ptt.configure(bg=BG_CARD, activebackground=BG_CARD_HOVER)
-        self.visualizer.set_idle()
-        self.lbl_instruction.config(text="Processing audio with AI & Logic Gates...", fg=ACCENT_AMBER)
-
         now = datetime.now()
-        entry_id = now.strftime("%Y%m%d-%H%M%S")
-        self.current_entry_id = entry_id
+        date_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H%M%S")
+        audio_filename = f"voice_{date_str}_{time_str}.wav"
+        save_dir = self.vault_mgr.get_voice_attachments_dir()
+        save_path = save_dir / audio_filename
 
-        # Target audio path inside Obsidian attachments
-        audio_filename = f"voice_{now.strftime('%Y-%m-%d_%H%M%S')}.wav"
-        attachments_dir = self.vault_mgr.get_attachments_dir(
-            self.config_data.get("attachments_folder", "Attachments/VoiceLogs")
-        )
-        audio_save_path = attachments_dir / audio_filename
-
-        # Stop recorder
-        saved_path, duration, raw_bytes = self.recorder.stop(save_path=audio_save_path)
+        saved_path, duration, raw_bytes = self.recorder.stop(save_path=save_path)
+        self.visualizer.set_idle()
 
         if duration < 0.3 or not raw_bytes:
-            self._reset_to_idle()
-            self.lbl_instruction.config(text="Recording too brief (under 0.3s). Try again.", fg=TEXT_MUTED)
+            self._reset_idle()
+            self.lbl_status.config(text="Recording too brief (< 0.3s). Try again.", fg=TEXT_MUTED)
             return
 
-        # Relative path for Obsidian wikilink
-        rel_audio_path = f"{self.config_data.get('attachments_folder', 'Attachments/VoiceLogs')}/{audio_filename}"
+        # Hand off to worker
+        self._start_processing(raw_text=None, audio_path=saved_path, duration=duration)
 
-        # Run synthesis in worker thread
+    def _start_processing(self, raw_text: Optional[str], audio_path: Optional[Path], duration: float):
+        self.state = STATE_PROCESSING
+        self.badge_state.lbl.config(text="● PROCESSING", fg=ACCENT_AMBER)
+        self.badge_state.config(highlightbackground=ACCENT_AMBER)
+        self.btn_ptt.configure(bg=BG_CARD_HOVER, activebackground=BORDER_SUBTLE)
+        self.lbl_status.config(text="AI understanding & Python organization...", fg=ACCENT_AMBER)
+        self.prog_bar.set_progress(0.15)
+
+        now = datetime.now()
         threading.Thread(
-            target=self._synthesis_worker,
-            args=(saved_path, entry_id, now, duration, rel_audio_path),
+            target=self._worker_pipeline,
+            args=(raw_text, audio_path, duration, now),
             daemon=True
         ).start()
 
-    def _synthesis_worker(self, audio_path: Path, entry_id: str, now: datetime, duration: float, rel_audio_path: str):
-        """Worker thread orchestrating SpeechEngine -> LogicGates -> SQLite & Obsidian Vault."""
+    def _worker_pipeline(self, raw_text: Optional[str], audio_path: Optional[Path], duration: float, now: datetime):
         try:
-            self.msg_queue.put(("SYNTHESIS_PROGRESS", (0.25, "Transcribing speech and extracting intent...")))
-            ai_data = self.speech_engine.process_audio(audio_path)
+            # 1. Speech-to-text if audio
+            if not raw_text and audio_path:
+                self.msg_queue.put(("PROGRESS", (0.30, "Transcribing voice recording locally...")))
+                raw_text = self.stt_provider.transcribe(audio_path)
+                if not raw_text:
+                    raw_text = f"[Spoken entry recorded at {now.strftime('%H:%M:%S')}]"
 
-            self.msg_queue.put(("SYNTHESIS_PROGRESS", (0.60, "Running Python Logic Gates & resolving Obsidian graph...")))
-            # Refresh vault index before matching
-            self.logic_engine.indexer.refresh_index()
-            gate_result = self.logic_engine.process_entry(
+            # 2. Local AI Understanding
+            self.msg_queue.put(("PROGRESS", (0.55, "Local LLM understanding academic concepts...")))
+            ai_data = self.llm_provider.analyze_academic_input(raw_text)
+
+            # 3. Inspect Vault & Read Today's Journal
+            self.msg_queue.put(("PROGRESS", (0.75, "Python Logic Gates resolving entities against vault...")))
+            existing_content = self.vault_mgr.read_existing_daily_journal(now)
+
+            # 4. Run Logic Gates
+            gate_result = self.logic_engine.process_academic_entry(
+                raw_text=raw_text,
                 ai_data=ai_data,
-                entry_id=entry_id,
                 timestamp_dt=now,
-                audio_rel_path=rel_audio_path
+                existing_journal_content=existing_content
             )
 
-            self.msg_queue.put(("SYNTHESIS_PROGRESS", (0.85, "Writing to Obsidian Vault & Local SQLite Database...")))
-            # 1. Save Markdown Note to Vault
-            note_path = self.vault_mgr.save_journal_note(
-                timestamp_dt=now,
-                markdown_content=gate_result["markdown_content"],
-                subfolder=self.config_data.get("journal_folder", "Journal/Voice")
-            )
+            # 5. Save to Canonical Journal-YYYY-MM-DD.md
+            self.msg_queue.put(("PROGRESS", (0.90, "Saving to Academy/Journal/Journal-YYYY-MM-DD.md...")))
+            journal_path = self.vault_mgr.save_daily_journal(now, gate_result["journal_markdown"])
 
-            # 2. Interlock with Daily Notes
-            if self.config_data.get("auto_link_vault", True):
-                self.vault_mgr.update_daily_note(
-                    timestamp_dt=now,
-                    snippet=gate_result["daily_note_snippet"],
-                    daily_folder=self.config_data.get("daily_notes_folder", "Daily Notes")
-                )
-
-            # 3. Save to Local SQLite Registry
+            # 6. Save Internal SQLite audit
+            entry_id = now.strftime("%Y%m%d-%H%M%S")
             self.storage.insert_entry({
                 "id": entry_id,
+                "date": gate_result["date_str"],
                 "timestamp": now.isoformat(),
-                "audio_path": str(audio_path),
+                "entry_type": "voice" if audio_path else "text",
+                "audio_path": str(audio_path) if audio_path else None,
                 "audio_duration": duration,
-                "raw_transcript": ai_data.get("raw_transcript", ""),
-                "title": gate_result["title"],
-                "summary": ai_data.get("summary", ""),
-                "key_insights": ai_data.get("key_insights", []),
-                "action_items": ai_data.get("action_items", []),
-                "entities": gate_result["resolved_entities"],
-                "vault_file_path": str(note_path)
+                "raw_transcript": raw_text,
+                "summary": gate_result["summary"],
+                "ai_data": ai_data,
+                "vault_file_path": str(journal_path),
+                "status": "processed"
             })
 
-            self.msg_queue.put(("SYNTHESIS_PROGRESS", (1.0, "Saved to Obsidian Vault & Local Registry!")))
-            self.msg_queue.put(("ENTRY_PROCESSED", {
-                "ai_data": ai_data,
+            self.msg_queue.put(("PROGRESS", (1.0, f"Saved to {journal_path.name}!")))
+            self.msg_queue.put(("ENTRY_COMPLETE", {
+                "journal_path": journal_path,
+                "raw_text": raw_text,
                 "gate_result": gate_result,
-                "note_path": note_path,
-                "duration": duration,
-                "timestamp": now
+                "now": now
             }))
 
         except Exception as e:
-            self.msg_queue.put(("PROCESSING_ERROR", str(e)))
+            self.msg_queue.put(("ERROR", str(e)))
 
-    def _on_entry_complete(self, payload: Dict[str, Any]):
-        """Renders the synthesized entry and graph links into the UI."""
+    def _render_completed_entry(self, payload: Dict[str, Any]):
         self.state = STATE_COMPLETED
-        self.last_saved_note_path = payload["note_path"]
-        self.last_processed_result = payload
-
-        ai_data = payload["ai_data"]
-        gate_result = payload["gate_result"]
-        title = gate_result["title"]
-        category = gate_result.get("category", "Thought")
-        sentiment = gate_result.get("sentiment", "Focused")
+        self.last_saved_note_path = payload["journal_path"]
+        raw_text = payload["raw_text"]
+        res = payload["gate_result"]
+        now = payload["now"]
 
         self.badge_state.lbl.config(text="✔ SAVED", fg=ACCENT_EMERALD)
         self.badge_state.config(highlightbackground=ACCENT_EMERALD)
-        self.lbl_instruction.config(
-            text=f"✔ Saved note in Obsidian Vault: {Path(self.last_saved_note_path).name}",
-            fg=ACCENT_EMERALD
-        )
+        self.lbl_status.config(text=f"✔ Updated {self.last_saved_note_path.name}", fg=ACCENT_EMERALD)
 
-        self.lbl_entry_title.config(text=title)
-        self.badge_category.lbl.config(text=category)
-        self.badge_sentiment.lbl.config(text=sentiment)
+        # Update text view
+        self.display_text.delete("1.0", tk.END)
 
-        # Populate output text
-        self.output_text.delete("1.0", tk.END)
+        rendered = f"""=== 📝 ORIGINAL ENTRY (Preserved) ===
+> [{now.strftime('%H:%M')}] {raw_text}
 
-        formatted_display = f"""=== 🧠 AI SYNTHESIZED SUMMARY ===
-{ai_data.get('summary', '')}
-
-=== 💡 KEY INSIGHTS ===
+=== 🧠 SUMMARY ===
+{res.get('summary', '')}
 """
-        for item in ai_data.get("key_insights", []):
-            formatted_display += f"• {item}\n"
+        if res.get("what_i_learned"):
+            rendered += "\n=== 💡 WHAT I LEARNED ===\n"
+            for item in res["what_i_learned"]:
+                rendered += f"• {item}\n"
 
-        if ai_data.get("action_items"):
-            formatted_display += "\n=== 🎯 ACTION ITEMS ===\n"
-            for item in ai_data.get("action_items", []):
-                formatted_display += f"☐ {item}\n"
+        if res.get("problems"):
+            rendered += "\n=== ❓ PROBLEMS / GAPS ===\n"
+            for item in res["problems"]:
+                rendered += f"• {item}\n"
 
-        formatted_display += f"""
-=== 📝 RAW TRANSCRIPT ===
-"{ai_data.get('raw_transcript', '')}"
-"""
-        self.output_text.insert(tk.END, formatted_display)
+        if res.get("actions"):
+            rendered += "\n=== 🎯 NEXT ACTIONS ===\n"
+            for item in res["actions"]:
+                rendered += f"☐ {item}\n"
 
-        # Populate Wikilink badges
-        for child in self.tags_container.winfo_children():
+        rendered += f"\n=== 📂 OBSIDIAN FILE ===\n{self.last_saved_note_path}\n"
+        self.display_text.insert(tk.END, rendered)
+
+        # Update link badges
+        for child in self.links_container.winfo_children():
             child.destroy()
 
-        resolved = gate_result.get("resolved_entities", [])
-        if resolved:
-            for ent in resolved[:6]:
-                badge_text = ent["wikilink"]
-                color = ACCENT_EMERALD if ent["match_type"] == "exact" else ACCENT_CYAN
-                b = Badge(self.tags_container, text=badge_text, color=color, font_size=8)
+        links = res.get("connections", [])
+        if links:
+            for lk in links[:6]:
+                b = Badge(self.links_container, text=lk, color=ACCENT_CYAN, font_size=8)
                 b.pack(side="left", padx=(0, 4))
         else:
-            lbl_none = tk.Label(self.tags_container, text="No links", font=(FONT_FAMILY, 8), fg=TEXT_DIM, bg=BG_CARD)
+            lbl_none = tk.Label(self.links_container, text="None", font=(FONT_FAMILY, 8), fg=TEXT_DIM, bg=BG_CARD)
             lbl_none.pack(side="left")
 
-    def _on_error(self, err_msg: str):
-        """Displays error details and restores idle state."""
+    def _render_error(self, err: str):
         self.state = STATE_IDLE
         self.badge_state.lbl.config(text="● ERROR", fg=ACCENT_ROSE)
         self.badge_state.config(highlightbackground=ACCENT_ROSE)
-        self.lbl_instruction.config(text=f"Error: {err_msg}", fg=ACCENT_ROSE)
+        self.lbl_status.config(text=f"Error: {err}", fg=ACCENT_ROSE)
         self.prog_bar.set_progress(0.0)
 
-    def _reset_to_idle(self):
-        """Resets UI back to ready state."""
+    def _reset_idle(self):
         self.state = STATE_IDLE
         self.badge_state.lbl.config(text="● READY", fg=ACCENT_EMERALD)
         self.badge_state.config(highlightbackground=ACCENT_EMERALD)
         self.lbl_timer.config(text="00:00")
         self.prog_bar.set_progress(0.0)
-        self.lbl_instruction.config(
-            text="Hold [ Alt + Shift ] to speak your thoughts...",
-            fg=TEXT_MUTED
-        )
+        self.lbl_status.config(text="Hold [ Alt + Shift ] to speak, or type notes below.", fg=TEXT_MUTED)
         self.visualizer.set_idle()
-        self.btn_ptt.configure(bg=BG_CARD, activebackground=BG_CARD_HOVER)
+        self.btn_ptt.configure(bg=BG_CARD_HOVER, activebackground=BORDER_SUBTLE)
 
-    def _display_welcome_message(self):
-        """Renders the default instructions into the text area."""
-        self.output_text.delete("1.0", tk.END)
-        welcome = f"""Welcome to {APP_NAME}!
+    def _show_welcome_text(self):
+        self.display_text.delete("1.0", tk.END)
+        welcome = f"""Academic Journal — Daily Capture
 
-HOW TO USE:
-1. Hold [ Alt + Shift ] anytime to start recording your voice.
-   (You can also click and hold the "Push & Hold to Talk" button).
-2. Speak your thoughts, ideas, tasks, or reflections naturally.
-3. Release the keys when you are done speaking.
+WORKFLOW:
+1. Speak: Hold [ Alt + Shift ] (or click & hold "Hold to Talk").
+2. Type: Enter thoughts into the quick capture box and press Ctrl+Enter.
 
-WHAT HAPPENS NEXT:
-• Your voice is transcribed and synthesized into an insightful summary.
-• The Python Logic Gates Engine analyzes your Obsidian vault:
-    - Matches topics with existing notes as [[Wikilinks]]
-    - Organizes insights and actionable checklists
-    - Interlocks with your Daily Notes
-• Audio logs and Markdown notes are saved to your PC and Obsidian vault.
+HOW IT ORGANIZES:
+• Consolidates all events into ONE daily note:
+  Academy/Journal/Journal-{datetime.now().strftime('%Y-%m-%d')}.md
+• Preserves your exact wording under "## Original Entry".
+• Uses Local AI & Python Logic Gates to identify:
+  - What you learned
+  - Unresolved problems & learning gaps
+  - Assignments & Next Actions
+  - Links to existing subjects & Science Faculty teacher notes.
 """
-        self.output_text.insert(tk.END, welcome)
+        self.display_text.insert(tk.END, welcome)
 
     # -------------------------------------------------------------
     # Obsidian & Settings Actions
     # -------------------------------------------------------------
     def _open_in_obsidian(self):
-        """Opens the active journal note in Obsidian or the OS file manager."""
-        if not self.last_saved_note_path or not self.last_saved_note_path.exists():
-            messagebox.showinfo("No Note Selected", "Record an entry first to open it in Obsidian.")
+        target = self.last_saved_note_path or self.vault_mgr.get_daily_journal_path(datetime.now())
+        if not target.exists():
+            messagebox.showinfo("No File", f"No journal file created yet for today ({target.name}).")
             return
-
         try:
-            # Try Obsidian URI first
-            uri = self.vault_mgr.get_obsidian_uri(self.last_saved_note_path)
+            uri = self.vault_mgr.get_obsidian_uri(target)
             os.startfile(uri)
         except Exception:
-            # Fallback: open markdown file directly
-            os.startfile(str(self.last_saved_note_path))
+            os.startfile(str(target))
 
     def _open_settings_dialog(self):
-        """Opens modal configuration dialog for Vault path and AI API keys."""
         win = tk.Toplevel(self)
-        win.title("Voice Journal Settings")
-        win.geometry("520x420")
+        win.title("Academic Journal Settings")
+        win.geometry("520x460")
         win.resizable(False, False)
         win.configure(bg=BG_ROOT)
         win.transient(self)
         win.grab_set()
 
-        # Center dialog
-        win.update_idletasks()
-        cx = self.winfo_x() + (WINDOW_WIDTH - 520) // 2
-        cy = self.winfo_y() + (WINDOW_HEIGHT - 420) // 2
-        win.geometry(f"+{cx}+{cy}")
-
         content = SectionCard(win)
         content.pack(fill="both", expand=True, padx=16, pady=16)
 
-        lbl_hdr = tk.Label(content, text="⚙ System Configuration", font=(FONT_FAMILY, 12, "bold"), fg=TEXT_WHITE, bg=BG_CARD)
-        lbl_hdr.pack(anchor="w", pady=(0, 14))
+        lbl_hdr = tk.Label(content, text="⚙ Local AI & Vault Configuration", font=(FONT_FAMILY, 12, "bold"), fg=TEXT_WHITE, bg=BG_CARD)
+        lbl_hdr.pack(anchor="w", pady=(0, 12))
 
         # Vault Path
         lbl_v = tk.Label(content, text="Obsidian Vault Directory:", font=(FONT_FAMILY, 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD)
         lbl_v.pack(anchor="w")
-        ent_vault = tk.Entry(content, bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=ACCENT_CYAN, font=(FONT_FAMILY, 10), bd=1, relief="solid")
+        ent_vault = tk.Entry(content, bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=ACCENT_CYAN, font=(FONT_FAMILY, 9), bd=1, relief="solid")
         ent_vault.insert(0, self.config_data.get("obsidian_vault_path", r"C:\Tethis-System"))
-        ent_vault.pack(fill="x", pady=(4, 12))
+        ent_vault.pack(fill="x", pady=(2, 10))
 
-        # Gemini API Key
-        lbl_g = tk.Label(content, text="Google Gemini API Key (Recommended for Fast Audio AI):", font=(FONT_FAMILY, 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD)
+        # Local LLM Server URL
+        lbl_u = tk.Label(content, text="Local LLM URL (Ollama, llama-server, LM Studio):", font=(FONT_FAMILY, 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD)
+        lbl_u.pack(anchor="w")
+        ent_url = tk.Entry(content, bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=ACCENT_CYAN, font=(FONT_FAMILY, 9), bd=1, relief="solid")
+        ent_url.insert(0, self.config_data.get("local_llm_url", "http://localhost:11434/v1"))
+        ent_url.pack(fill="x", pady=(2, 10))
+
+        # Local Model Name
+        lbl_m = tk.Label(content, text="Local Model (e.g. qwen2.5:7b-instruct):", font=(FONT_FAMILY, 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD)
+        lbl_m.pack(anchor="w")
+        ent_model = tk.Entry(content, bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=ACCENT_CYAN, font=(FONT_FAMILY, 9), bd=1, relief="solid")
+        ent_model.insert(0, self.config_data.get("local_llm_model", "qwen2.5:7b-instruct"))
+        ent_model.pack(fill="x", pady=(2, 10))
+
+        # Optional Gemini Fallback
+        lbl_g = tk.Label(content, text="Optional Cloud Fallback (Gemini API Key):", font=(FONT_FAMILY, 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD)
         lbl_g.pack(anchor="w")
-        ent_gemini = tk.Entry(content, show="*", bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=ACCENT_CYAN, font=(FONT_FAMILY, 10), bd=1, relief="solid")
-        ent_gemini.insert(0, self.config_data.get("gemini_api_key", ""))
-        ent_gemini.pack(fill="x", pady=(4, 12))
+        ent_gem = tk.Entry(content, show="*", bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=ACCENT_CYAN, font=(FONT_FAMILY, 9), bd=1, relief="solid")
+        ent_gem.insert(0, self.config_data.get("gemini_api_key", ""))
+        ent_gem.pack(fill="x", pady=(2, 14))
 
-        # OpenAI API Key
-        lbl_o = tk.Label(content, text="OpenAI API Key (Optional Alternative):", font=(FONT_FAMILY, 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD)
-        lbl_o.pack(anchor="w")
-        ent_openai = tk.Entry(content, show="*", bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=ACCENT_CYAN, font=(FONT_FAMILY, 10), bd=1, relief="solid")
-        ent_openai.insert(0, self.config_data.get("openai_api_key", ""))
-        ent_openai.pack(fill="x", pady=(4, 16))
-
-        # Save Button
         def do_save():
-            new_vault = ent_vault.get().strip()
-            new_gemini = ent_gemini.get().strip()
-            new_openai = ent_openai.get().strip()
-
-            self.config_data["obsidian_vault_path"] = new_vault
-            self.config_data["gemini_api_key"] = new_gemini
-            self.config_data["openai_api_key"] = new_openai
+            self.config_data["obsidian_vault_path"] = ent_vault.get().strip()
+            self.config_data["local_llm_url"] = ent_url.get().strip()
+            self.config_data["local_llm_model"] = ent_model.get().strip()
+            self.config_data["gemini_api_key"] = ent_gem.get().strip()
             save_config(self.config_data)
 
-            # Re-init vault manager and logic engine
-            self.vault_mgr = ObsidianVaultManager(new_vault)
-            self.logic_engine = LogicGatesEngine(new_vault)
-            self.speech_engine.refresh_config()
+            self.vault_path = self.config_data["obsidian_vault_path"]
+            self.vault_mgr = ObsidianVaultManager(self.vault_path)
+            self.logic_engine = LogicGatesEngine(self.vault_path)
+            self.llm_provider.refresh_config()
 
-            v_name = Path(new_vault).name if new_vault else "Vault"
+            v_name = Path(self.vault_path).name if self.vault_path else "Vault"
             self.badge_vault.lbl.config(text=f"📂 {v_name}")
+            self.badge_model.lbl.config(text=f"⚡ {self.config_data['local_llm_model']}")
             win.destroy()
-            messagebox.showinfo("Settings Saved", "Configuration updated successfully!")
+            messagebox.showinfo("Saved", "Settings updated.")
 
-        btn_save = StyledButton(
-            content,
-            text="Save Settings",
-            command=do_save,
-            bg_color=ACCENT_CYAN,
-            fg_color=BG_ROOT,
-            hover_color=TEXT_WHITE
-        )
-        btn_save.pack(anchor="e", pady=(8, 0))
+        btn_save = StyledButton(content, text="Save Settings", command=do_save, bg_color=ACCENT_CYAN, fg_color=BG_ROOT)
+        btn_save.pack(anchor="e")
 
     def _on_close(self):
-        """Shuts down hotkey listener and audio streams on exit."""
         try:
             self.hotkey_listener.stop()
             self.recorder.stop()

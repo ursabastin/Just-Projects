@@ -13,138 +13,221 @@ if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
 from storage import StorageManager
-from logic_gates import LogicGatesEngine, VaultGraphIndexer, EntityTopicResolutionGate
+from logic_gates import LogicGatesEngine, VaultGraphIndexer, EntityTopicResolutionGate, DailyJournalBuilderGate
 from obsidian_vault import ObsidianVaultManager
-from speech_engine import SpeechAndSynthesisEngine
+from local_llm import LocalLLMProvider
 
-class TestVoiceJournalSystem(unittest.TestCase):
+class TestAcademicJournalSystem(unittest.TestCase):
 
     def setUp(self):
-        self.test_dir = tempfile.mkdtemp(prefix="test_journal_")
-        self.vault_dir = Path(self.test_dir) / "TestVault"
+        self.test_dir = tempfile.mkdtemp(prefix="test_academic_journal_")
+        self.vault_dir = Path(self.test_dir) / "Tethis-System"
         self.vault_dir.mkdir(parents=True)
         self.db_path = Path(self.test_dir) / "test_registry.db"
 
-        # Create mock notes in test vault
-        (self.vault_dir / "Deep Learning.md").write_text(
-            "---\naliases: [DL, Neural Nets]\ntags: [ai, tech]\n---\n# Deep Learning\nContent here.",
+        # Create existing faculty & subject notes in test vault
+        faculty_dir = self.vault_dir / "Faculty"
+        faculty_dir.mkdir()
+        (faculty_dir / "Prof. Sharma.md").write_text(
+            "---\naliases: [Sharma Sir, Science Faculty - Sharma]\ntags: [faculty, science]\n---\n# Prof. Sharma\nHead of Computer Science.",
             encoding="utf-8"
         )
-        (self.vault_dir / "Project Tethis.md").write_text(
-            "---\naliases: [Tethis System]\ntags: [projects]\n---\n# Project Tethis\nSystem specifications.",
+        subjects_dir = self.vault_dir / "Subjects"
+        subjects_dir.mkdir()
+        (subjects_dir / "C++ Programming.md").write_text(
+            "---\naliases: [C plus plus, CPP, C++]\ntags: [programming, bca]\n---\n# C++ Programming\nCourse material.",
             encoding="utf-8"
         )
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    def test_local_llm_schema_and_deterministic_fallback(self):
+        """Verify LocalLLMProvider produces structured academic JSON without sentiment fields."""
+        llm = LocalLLMProvider()
+        sample_input = "Today was my first C++ practical. Sir explained variables and data types but I still don't understand type casting. We got an assignment to write five programs."
+        result = llm.analyze_academic_input(sample_input)
+
+        # Verify expected academic fields
+        self.assertIn("summary", result)
+        self.assertIn("topics", result)
+        self.assertIn("entities", result)
+        self.assertIn("what_i_learned", result)
+        self.assertIn("learning_gaps", result)
+        self.assertIn("assignments", result)
+        self.assertIn("tasks", result)
+        self.assertIn("suggested_links", result)
+
+        # Verify NO sentiment field
+        self.assertNotIn("sentiment", result)
+        self.assertNotIn("mood", result)
+
+        # Verify extracted academic understanding
+        self.assertTrue(any("c++" in t.lower() or "variable" in t.lower() for t in result["topics"]))
+        self.assertTrue(len(result["learning_gaps"]) > 0, "Should detect type casting learning gap")
+        self.assertTrue(len(result["assignments"]) > 0, "Should detect 5 programs assignment")
+
+    def test_entity_resolution_and_faculty_reuse(self):
+        """Verify Gate 2 resolves spoken terms against existing vault notes without creating duplicates."""
+        indexer = VaultGraphIndexer(str(self.vault_dir))
+        indexer.refresh_index()
+        resolver = EntityTopicResolutionGate(indexer)
+
+        # Exact match
+        res1 = resolver.resolve_topic("C++ Programming")
+        self.assertEqual(res1["match_type"], "exact")
+        self.assertEqual(res1["wikilink"], "[[C++ Programming]]")
+
+        # Alias match for faculty
+        res2 = resolver.resolve_topic("Sharma Sir")
+        self.assertEqual(res2["match_type"], "alias")
+        self.assertEqual(res2["wikilink"], "[[Prof. Sharma]]")
+
+        # Academic normalization (C plus plus -> C++ Programming)
+        res3 = resolver.resolve_topic("C plus plus")
+        self.assertEqual(res3["wikilink"], "[[C++ Programming]]")
+
+    def test_canonical_daily_journal_initial_build(self):
+        """Verify canonical single-file Journal-YYYY-MM-DD.md format and raw preservation."""
+        engine = LogicGatesEngine(str(self.vault_dir))
+        vault_mgr = ObsidianVaultManager(str(self.vault_dir))
+
+        now = datetime(2026, 9, 14, 10, 15, 0)
+        raw_text = "Today was my first C++ practical. Sir explained variables and data types but I still don't understand type casting."
+
+        ai_data = {
+            "summary": "Attended first C++ practical and covered variables and data types, noting type casting as a learning gap.",
+            "topics": ["C++ Programming", "Variables", "Data Types"],
+            "entities": ["Prof. Sharma"],
+            "what_i_learned": ["Variables allocate memory based on data type."],
+            "learning_gaps": ["Type casting rules between float and int."],
+            "assignments": [],
+            "tasks": ["Review type casting chapter."],
+            "decisions": [],
+            "progress": [],
+            "suggested_links": ["C++ Programming", "Variables", "Prof. Sharma"]
+        }
+
+        gate_res = engine.process_academic_entry(
+            raw_text=raw_text,
+            ai_data=ai_data,
+            timestamp_dt=now,
+            existing_journal_content=None
+        )
+
+        # Save to vault
+        journal_path = vault_mgr.save_daily_journal(now, gate_res["journal_markdown"])
+        self.assertTrue(journal_path.exists())
+        self.assertEqual(journal_path.name, "Journal-2026-09-14.md")
+        self.assertEqual(journal_path.parent.name, "Journal")
+        self.assertEqual(journal_path.parent.parent.name, "Academy")
+
+        content = journal_path.read_text(encoding="utf-8")
+
+        # Verify Canonical Schema
+        self.assertIn("type: journal", content)
+        self.assertIn("date: 2026-09-14", content)
+        self.assertIn("domain: academy", content)
+        self.assertIn("# Journal — 2026-09-14", content)
+
+        # Strict Rule: Raw input preserved verbatim
+        self.assertIn("## Original Entry", content)
+        self.assertIn(raw_text, content)
+
+        # Verify Structured Sections
+        self.assertIn("## Summary", content)
+        self.assertIn("## What I Learned", content)
+        self.assertIn("## Connections", content)
+        self.assertIn("[[C++ Programming]]", content)
+        self.assertIn("[[Prof. Sharma]]", content)
+        self.assertIn("## Problems", content)
+        self.assertIn("Type casting rules", content)
+        self.assertIn("## Next Actions", content)
+        self.assertIn("- [ ] Review type casting chapter.", content)
+
+        # Empty sections must NOT exist
+        self.assertNotIn("## Sources", content)
+        self.assertNotIn("## Progress", content)
+        self.assertNotIn("## Decisions", content)
+
+    def test_multi_entry_same_day_merge(self):
+        """Verify multiple events on the same calendar day are appended into the single Journal-YYYY-MM-DD.md."""
+        engine = LogicGatesEngine(str(self.vault_dir))
+        vault_mgr = ObsidianVaultManager(str(self.vault_dir))
+
+        # Event 1: Morning lecture at 09:30
+        now1 = datetime(2026, 9, 14, 9, 30, 0)
+        raw1 = "Morning lecture with Sharma Sir. He introduced BCA course syllabus."
+        ai1 = {
+            "summary": "Sharma Sir introduced BCA course syllabus.",
+            "topics": ["BCA"],
+            "entities": ["Prof. Sharma"],
+            "what_i_learned": ["Overview of semester subjects."],
+            "learning_gaps": [],
+            "assignments": [],
+            "tasks": [],
+            "decisions": [],
+            "progress": [],
+            "suggested_links": ["BCA", "Prof. Sharma"]
+        }
+        res1 = engine.process_academic_entry(raw1, ai1, now1, existing_journal_content=None)
+        file_path = vault_mgr.save_daily_journal(now1, res1["journal_markdown"])
+
+        # Event 2: Afternoon practical at 14:30 on the SAME day
+        now2 = datetime(2026, 9, 14, 14, 30, 0)
+        raw2 = "Afternoon lab: wrote 3 programs for C++ variables and loops."
+        ai2 = {
+            "summary": "Completed lab programs on variables and loops.",
+            "topics": ["C++ Programming", "Variables", "Loops"],
+            "entities": [],
+            "what_i_learned": ["Syntax of for loop in C++."],
+            "learning_gaps": ["Nested loops iteration logic."],
+            "assignments": ["Submit lab report by Friday."],
+            "tasks": ["Submit lab report by Friday."],
+            "decisions": [],
+            "progress": ["Wrote 3 programs."],
+            "suggested_links": ["C++ Programming", "Variables", "Loops"]
+        }
+
+        existing_content = vault_mgr.read_existing_daily_journal(now2)
+        self.assertIsNotNone(existing_content)
+
+        res2 = engine.process_academic_entry(raw2, ai2, now2, existing_journal_content=existing_content)
+        vault_mgr.save_daily_journal(now2, res2["journal_markdown"])
+
+        # Verify only 1 journal file exists for this day
+        journal_files = list(vault_mgr.get_journal_dir().glob("*.md"))
+        self.assertEqual(len(journal_files), 1, "Must have exactly ONE journal file per day")
+        self.assertEqual(journal_files[0].name, "Journal-2026-09-14.md")
+
+        final_content = journal_files[0].read_text(encoding="utf-8")
+
+        # Verify BOTH raw entries are preserved
+        self.assertIn("Morning lecture with Sharma Sir", final_content)
+        self.assertIn("Afternoon lab: wrote 3 programs", final_content)
+
+        # Verify sections aggregated cleanly
+        self.assertIn("[[Prof. Sharma]]", final_content)
+        self.assertIn("[[C++ Programming]]", final_content)
+        self.assertIn("Overview of semester subjects.", final_content)
+        self.assertIn("Syntax of for loop in C++.", final_content)
+        self.assertIn("Nested loops iteration logic.", final_content)
+        self.assertIn("Submit lab report by Friday.", final_content)
+
     def test_storage_registry(self):
-        """Verify SQLite insertion, queries, and count."""
+        """Verify internal SQLite database stores audit entries."""
         storage = StorageManager(db_path=self.db_path)
         entry_id = storage.insert_entry({
-            "id": "20260914-001",
-            "timestamp": "2026-09-14T12:00:00",
-            "audio_path": "/fake/audio.wav",
-            "audio_duration": 4.5,
-            "raw_transcript": "This is a test recording about machine learning.",
-            "title": "Test Thought",
-            "summary": "Summary of test recording.",
-            "key_insights": ["Insight 1", "Insight 2"],
-            "action_items": ["Action 1"],
-            "entities": [{"target": "Deep Learning", "wikilink": "[[Deep Learning]]"}],
-            "vault_file_path": "/fake/vault/note.md"
+            "id": "20260914-101500",
+            "date": "2026-09-14",
+            "entry_type": "text",
+            "raw_transcript": "Studied C++ variables.",
+            "summary": "Learned C++ variables.",
+            "ai_data": {"topics": ["C++"]},
+            "vault_file_path": "/path/to/Journal-2026-09-14.md"
         })
-        self.assertEqual(entry_id, "20260914-001")
+        self.assertEqual(entry_id, "20260914-101500")
         self.assertEqual(storage.get_entry_count(), 1)
-        entries = storage.get_recent_entries(limit=5)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["title"], "Test Thought")
-        self.assertEqual(len(entries[0]["key_insights"]), 2)
-
-    def test_logic_gates_indexing_and_resolution(self):
-        """Verify the 5 Python Logic Gates for Obsidian graph linking."""
-        engine = LogicGatesEngine(str(self.vault_dir))
-
-        # Test Exact Match (Gate 2)
-        res_exact = engine.entity_gate.resolve_topic("Deep Learning")
-        self.assertEqual(res_exact["match_type"], "exact")
-        self.assertEqual(res_exact["wikilink"], "[[Deep Learning]]")
-
-        # Test Alias Match (Gate 2)
-        res_alias = engine.entity_gate.resolve_topic("Neural Nets")
-        self.assertEqual(res_alias["match_type"], "alias")
-        self.assertEqual(res_alias["wikilink"], "[[Deep Learning|Neural Nets]]")
-
-        # Test Fuzzy Match (Gate 2)
-        res_fuzzy = engine.entity_gate.resolve_topic("Deep Learnin")
-        self.assertEqual(res_fuzzy["match_type"], "fuzzy")
-        self.assertEqual(res_fuzzy["wikilink"], "[[Deep Learning|Deep Learnin]]")
-
-        # Test New Topic (Gate 2)
-        res_new = engine.entity_gate.resolve_topic("Quantum Cryptography")
-        self.assertEqual(res_new["match_type"], "new_topic")
-        self.assertEqual(res_new["wikilink"], "[[Quantum Cryptography]]")
-
-        # Test Full Pipeline (Gate 3, 4, 5)
-        ai_payload = {
-            "title": "Neural Pipeline Optimization",
-            "raw_transcript": "We should use Deep Learning for Project Tethis and study Quantum Cryptography.",
-            "summary": "Exploring Deep Learning applications within Project Tethis.",
-            "key_insights": ["High computational requirement", "Obsidian linking improves recall"],
-            "action_items": ["Run benchmark tests"],
-            "entities_and_topics": ["Deep Learning", "Project Tethis", "Quantum Cryptography"],
-            "category": "Project",
-            "sentiment": "Analytical"
-        }
-        now = datetime(2026, 9, 14, 14, 30, 0)
-        result = engine.process_entry(
-            ai_data=ai_payload,
-            entry_id="20260914-143000",
-            timestamp_dt=now,
-            audio_rel_path="Attachments/VoiceLogs/voice_test.wav"
-        )
-
-        md = result["markdown_content"]
-        self.assertIn("# 🎙️ Neural Pipeline Optimization", md)
-        self.assertIn("[[Deep Learning]]", md)
-        self.assertIn("[[Project Tethis]]", md)
-        self.assertIn("[[Quantum Cryptography]]", md)
-        self.assertIn("![[Attachments/VoiceLogs/voice_test.wav]]", md)
-        self.assertIn("category: \"Project\"", md)
-
-    def test_obsidian_vault_writer(self):
-        """Verify Obsidian file generation and daily note interlocking."""
-        vault_mgr = ObsidianVaultManager(str(self.vault_dir))
-        self.assertTrue(vault_mgr.is_valid_vault())
-
-        now = datetime(2026, 9, 14, 14, 30, 0)
-        note_path = vault_mgr.save_journal_note(
-            timestamp_dt=now,
-            markdown_content="# Note Content",
-            subfolder="Journal/Voice"
-        )
-        self.assertTrue(note_path.exists())
-        self.assertEqual(note_path.name, "2026-09-14_143000.md")
-
-        # Daily note interlock
-        daily_path = vault_mgr.update_daily_note(
-            timestamp_dt=now,
-            snippet="- **14:30** [[Journal/Voice/2026-09-14_143000|🎙️ Test]]: Some reflection",
-            daily_folder="Daily Notes"
-        )
-        self.assertTrue(daily_path.exists())
-        content = daily_path.read_text(encoding="utf-8")
-        self.assertIn("## 🎙️ Voice Reflections", content)
-        self.assertIn("2026-09-14_143000", content)
-
-    def test_speech_engine_offline_fallback(self):
-        """Verify speech engine offline fallback works gracefully without internet/key."""
-        engine = SpeechAndSynthesisEngine()
-        result = engine.process_text("Discussing Quantum Architecture with Alice and Bob on Monday.")
-        self.assertIn("title", result)
-        self.assertIn("summary", result)
-        self.assertIn("entities_and_topics", result)
-        self.assertIn("Architecture", result["entities_and_topics"])
 
 
 if __name__ == "__main__":
