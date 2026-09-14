@@ -1,0 +1,13 @@
+{
+  "obsidian_vault_path": "C:\\Tethis-System",
+  "gemini_api_key": "",
+  "openai_api_key": "",
+  "ai_provider": "gemini",
+  "gemini_model": "gemini-2.5-flash",
+  "hotkey": "alt+shift",
+  "save_audio_attachments": true,
+  "attachments_folder": "Attachments/VoiceLogs",
+  "journal_folder": "Journal/Voice",
+  "daily_notes_folder": "Daily Notes",
+  "auto_link_vault": true
+}
